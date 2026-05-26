@@ -6,58 +6,99 @@ const GROQ_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
 
 declare const chrome: { tabs?: any; runtime?: { lastError?: { message?: string } } };
 
-function sendToContentScript(message: Record<string, unknown>): Promise<any> {
+function sendToContentScript(message: Record<string, unknown>, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve) => {
     const chromeGlobal = typeof chrome !== 'undefined' ? chrome : (window as any).chrome;
     if (!chromeGlobal?.tabs) {
-      resolve(null);
+      resolve(message.type === 'SCAN_FORM_FIELDS' ? [] : null);
       return;
     }
+
     chromeGlobal.tabs.query({ active: true, currentWindow: true }, (tabs: any[]) => {
       if (!tabs[0]?.id) {
-        resolve(null);
+        resolve(message.type === 'SCAN_FORM_FIELDS' ? [] : null);
         return;
       }
       const tabId = tabs[0].id;
-      
-      const trySendMessage = () => {
-        chromeGlobal.tabs.sendMessage(tabId, message, (response: any) => {
-          if (chromeGlobal.runtime?.lastError) {
-            console.warn('[Sync] Content script error:', chromeGlobal.runtime.lastError.message);
-            resolve(null);
-          } else {
-            resolve(response);
-          }
-        });
+      let resolved = false;
+
+      // Timeout handling
+      const timer = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        console.warn(`[Sync] Message type ${message.type} timed out after ${timeoutMs}ms.`);
+        resolve(message.type === 'SCAN_FORM_FIELDS' ? [] : null);
+      }, timeoutMs);
+
+      const finish = (result: any) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        resolve(result);
       };
 
-      // Try sending the message first
-      chromeGlobal.tabs.sendMessage(tabId, message, (response: any) => {
-        if (chromeGlobal.runtime?.lastError) {
-          // If the receiving end does not exist, the content script might not be injected yet.
-          // Try to inject it manually using chrome.scripting.
-          if (chromeGlobal.scripting && chromeGlobal.scripting.executeScript) {
-             console.log('[Sync] Attempting to inject content.js manually...');
-             chromeGlobal.scripting.executeScript({
-               target: { tabId: tabId },
-               files: ['content.js']
-             }, () => {
-               if (chromeGlobal.runtime.lastError) {
-                 console.warn('[Sync] Failed to inject content script:', chromeGlobal.runtime.lastError.message);
-                 resolve(null);
-               } else {
-                 // Wait a brief moment for the script to initialize
-                 setTimeout(trySendMessage, 200);
-               }
-             });
-          } else {
-             console.warn('[Sync] Content script error:', chromeGlobal.runtime.lastError.message);
-             resolve(null);
-          }
-        } else {
-          resolve(response);
+      const trySendMessage = (isRetry = false) => {
+        try {
+          chromeGlobal.tabs.sendMessage(tabId, message, (response: any) => {
+            const err = chromeGlobal.runtime?.lastError;
+            if (err) {
+              const errMsg = err.message || '';
+              console.warn(`[Sync] SendMessage error (isRetry: ${isRetry}):`, errMsg);
+
+              if (!isRetry && (
+                errMsg.includes('Could not establish connection') ||
+                errMsg.includes('Receiving end does not exist') ||
+                errMsg.includes('connection matches no receiver')
+              )) {
+                attemptReinjection();
+              } else {
+                finish(message.type === 'SCAN_FORM_FIELDS' ? [] : null);
+              }
+            } else {
+              // Extract fields for SCAN_FORM_FIELDS response robustly
+              if (message.type === 'SCAN_FORM_FIELDS') {
+                if (response && response.fields && Array.isArray(response.fields)) {
+                  finish(response.fields);
+                } else if (Array.isArray(response)) {
+                  finish(response);
+                } else {
+                  finish([]);
+                }
+              } else {
+                finish(response);
+              }
+            }
+          });
+        } catch (e: any) {
+          console.warn('[Sync] Exception during sendMessage:', e);
+          finish(message.type === 'SCAN_FORM_FIELDS' ? [] : null);
         }
-      });
+      };
+
+      const attemptReinjection = () => {
+        if (chromeGlobal.scripting && chromeGlobal.scripting.executeScript) {
+          console.log('[Sync] Attempting to inject content.js manually...');
+          chromeGlobal.scripting.executeScript({
+            target: { tabId: tabId },
+            files: ['content.js']
+          }, () => {
+            const err = chromeGlobal.runtime?.lastError;
+            if (err) {
+              console.warn('[Sync] Failed to inject content script:', err.message);
+              finish(message.type === 'SCAN_FORM_FIELDS' ? [] : null);
+            } else {
+              // Wait briefly for content script to initialize before retrying
+              setTimeout(() => {
+                trySendMessage(true);
+              }, 300);
+            }
+          });
+        } else {
+          finish(message.type === 'SCAN_FORM_FIELDS' ? [] : null);
+        }
+      };
+
+      trySendMessage(false);
     });
   });
 }
