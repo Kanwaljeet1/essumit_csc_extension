@@ -304,12 +304,22 @@
 
         // Send raw fields to content script - content.js handles the deep fuzzy mapping
         if (typeof chrome !== "undefined" && chrome.tabs) {
-          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+          chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
             if (tabs[0]) {
-              chrome.tabs.sendMessage(tabs[0].id, {
-                action: "FILL_FORM_DESKTOP",
-                data: fieldsJson
-              });
+              if (typeof CSCUtils !== "undefined" && CSCUtils.sendRobustTabMessage) {
+                const res = await CSCUtils.sendRobustTabMessage(tabs[0].id, {
+                  action: "FILL_FORM_DESKTOP",
+                  data: fieldsJson
+                });
+                if (!res.success) {
+                  console.warn("[Panel] FILL_FORM_DESKTOP failed", res.details);
+                }
+              } else {
+                chrome.tabs.sendMessage(tabs[0].id, {
+                  action: "FILL_FORM_DESKTOP",
+                  data: fieldsJson
+                });
+              }
             }
           });
         }
@@ -928,24 +938,58 @@
 
         if (statusEl) statusEl.textContent = "फॉर्म स्कैन हो रहा है... / Scanning open form...";
 
-        try {
-          const result = await CSCUtils.sendRobustTabMessage(tabId, { type: "SCAN_FORM_FIELDS" });
-          if (result.success) {
-            // Unpack fields if present in structured response format, else check response directly
-            const resp = result.response;
-            const fields = resp && resp.fields ? resp.fields : (Array.isArray(resp) ? resp : []);
-            resolve(fields);
-          } else {
-            let errorMsg = result.details || "Unknown error occurred";
-            if (result.error === "RESTRICTED_PAGE") {
-              errorMsg = "सुरक्षा प्रतिबंधों के कारण इस सरकारी पोर्टल पर स्क्रिप्ट एक्सेस ब्लॉक है। / Script access is blocked on this page due to security restrictions.";
-            } else if (result.error === "TIMEOUT") {
-              errorMsg = "फॉर्म स्कैन टाइमआउट हो गया। कृपया पेज लोड होने दें। / Form scanning timed out. Please let the page load completely.";
+        if (typeof CSCUtils !== "undefined" && CSCUtils.sendRobustTabMessage) {
+          try {
+            const result = await CSCUtils.sendRobustTabMessage(tabId, { type: "SCAN_FORM_FIELDS" });
+            if (result.success) {
+              // Unpack fields if present in structured response format, else check response directly
+              const resp = result.response;
+              const fields = resp && resp.fields ? resp.fields : (Array.isArray(resp) ? resp : []);
+              resolve(fields);
+            } else {
+              let errorMsg = result.details || "Unknown error occurred";
+              if (result.error === "RESTRICTED_PAGE") {
+                errorMsg = "सुरक्षा प्रतिबंधों के कारण इस सरकारी पोर्टल पर स्क्रिप्ट एक्सेस ब्लॉक है। / Script access is blocked on this page due to security restrictions.";
+              } else if (result.error === "TIMEOUT") {
+                errorMsg = "फॉर्म स्कैन टाइमआउट हो गया। कृपया पेज लोड होने दें। / Form scanning timed out. Please let the page load completely.";
+              }
+              reject(new Error(errorMsg));
             }
-            reject(new Error(errorMsg));
+          } catch (e) {
+            reject(e);
           }
-        } catch (e) {
-          reject(e);
+        } else {
+          // Fallback to legacy behavior if CSCUtils is not loaded
+          chrome.tabs.sendMessage(tabId, { type: "SCAN_FORM_FIELDS" }, (response) => {
+            if (chrome.runtime.lastError) {
+              // Content script not loaded — inject it first
+              if (chrome.scripting) {
+                chrome.scripting.executeScript(
+                  { target: { tabId: tabId }, files: ["content.js"] },
+                  () => {
+                    if (chrome.runtime.lastError) {
+                      reject(new Error(chrome.runtime.lastError.message));
+                      return;
+                    }
+                    setTimeout(() => {
+                      chrome.tabs.sendMessage(tabId, { type: "SCAN_FORM_FIELDS" }, (res2) => {
+                        if (chrome.runtime.lastError) {
+                          reject(new Error(chrome.runtime.lastError.message));
+                        } else {
+                          resolve(res2 || []);
+                        }
+                      });
+                    }, 500);
+                  }
+                );
+              } else {
+                reject(new Error("Cannot inject content script"));
+              }
+            } else {
+              resolve(response || []);
+            }
+          });
+        }
         }
       });
     });
@@ -1519,6 +1563,7 @@
   }
 
   function injectAndFillLegacy(tabId, finalFields, selectors, confidenceMap, config) {
+    // Inject content script programmatically, then retry
     if (chrome.scripting) {
       chrome.scripting.executeScript(
         { target: { tabId: tabId }, files: ["content.js"] },
